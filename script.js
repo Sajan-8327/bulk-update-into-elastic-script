@@ -142,38 +142,37 @@ class XanoToES {
     };
   }
 
- async bulkInsertToES(records) {
-    console.log(`📤 Preparing to bulk insert ${records.length} records to Elasticsearch`);
-    const body = records.flatMap(doc => [
-      { index: { _index: this.config.esIndex, _id: doc.id } },
-      doc,
-    ]);
+async bulkInsertToES(records) {
+  console.log(`📤 Preparing to bulk insert ${records.length} records to Elasticsearch`);
+  const body = records.flatMap(doc => [
+    { index: { _index: this.config.esIndex } },  // Let ES auto-generate _id
+    doc,
+  ]);
 
-    try {
-      console.log(`🚀 Sending bulk insert to Elasticsearch, index: ${this.config.esIndex}`);
-      const response = await this.es.bulk({ body });
+  try {
+    console.log(`🚀 Sending bulk insert to Elasticsearch, index: ${this.config.esIndex}`);
+    const response = await this.es.bulk({ body });
+    
+    if (response.body?.errors) {
+      console.warn("⚠️ Some records failed to index in Elasticsearch");
       
-      if (response.body?.errors) {
-        console.warn("⚠️ Some records failed to index in Elasticsearch");
-        
-        // Log the errors in the response body to understand the failure
-        response.body.items.forEach((item, index) => {
-          if (item.index?.error) {
-            console.error(`❌ Elasticsearch error for record ${item.index._id}:`, item.index.error.reason);
-            this.logError(item.index._id, `Elasticsearch Error: ${item.index.error.reason}`);
-          }
-        });
+      response.body.items.forEach((item, index) => {
+        if (item.index?.error) {
+          console.error(`❌ Elasticsearch error for record at index ${index}:`, item.index.error.reason);
+          this.logError(item.index._id || `unknown-${index}`, `Elasticsearch Error: ${item.index.error.reason}`);
+        }
+      });
 
-        // Log the full response to understand the issue better
-        console.error("🔴 Full Elasticsearch response for bulk insert:", JSON.stringify(response.body, null, 2));
-      } else {
-        console.log(`✅ Successfully inserted ${records.length} records to Elasticsearch`);
-      }
-    } catch (error) {
-      console.error("❌ Bulk insert to Elasticsearch failed:", error.message);
-      console.error("🔴 Full error details:", error.response ? error.response.data : error);
+      console.error("🔴 Full Elasticsearch response for bulk insert:", JSON.stringify(response.body, null, 2));
+    } else {
+      console.log(`✅ Successfully inserted ${records.length} records to Elasticsearch`);
     }
+  } catch (error) {
+    console.error("❌ Bulk insert to Elasticsearch failed:", error.message);
+    console.error("🔴 Full error details:", error.response ? error.response.data : error);
+  }
 }
+
 
 
   async run() {
