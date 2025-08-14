@@ -3,6 +3,10 @@ const axios = require("axios");
 const fs = require("fs/promises");
 const path = require("path");
 const { Client } = require("@elastic/elasticsearch");
+const { encode } = require("gpt-tokenizer");
+
+const EMBEDDING_DIM = 3072;
+const MAX_TOKEN_LENGTH = 8192; // Safe token limit for text-embedding-3-large
 
 class XanoToES {
   constructor() {
@@ -10,7 +14,7 @@ class XanoToES {
       xanoApiKey: process.env.XANO_API_KEY,
       workspaceId: process.env.XANO_WORKSPACE_ID,
       metaBaseURL: process.env.XANO_META_BASE_URL,
-      esUrl: process.env.ELASTICSEARCH_URL ,
+      esUrl: process.env.ELASTICSEARCH_URL,
       esIndex: process.env.ELASTICSEARCH_INDEX ,
       recordsPerPage: 2000,
       tableId: 106,
@@ -22,6 +26,7 @@ class XanoToES {
     this.lastProcessedRecordId = 0;
     this.failedRecords = [];
 
+    // Only keep Elasticsearch client - no axios instances
     this.es = new Client({ node: this.config.esUrl });
     console.log("🚀 XanoToES initialized with config:", {
       esUrl: this.config.esUrl,
@@ -87,6 +92,7 @@ class XanoToES {
     
     console.log(`🌐 Fetching records from Xano, page ${page}, URL:`, url);
     try {
+      // Create fresh axios instance for Xano API
       const res = await axios.get(url, {
         headers: {
           Authorization: `Bearer ${this.config.xanoApiKey}`,
@@ -101,6 +107,94 @@ class XanoToES {
       return [];
     }
   }
+
+async updateEmbeddingInXano(record) {
+  console.log(`🧠 Generating embedding for record ${record.id}`);
+
+  if (record.combined_embeddings && record.combined_embeddings.length > 0) {
+    console.log(`ℹ️ Record ${record.id} already has embeddings, skipping`);
+    return;
+  }
+
+  const jobTitle = (record.job_title || "").trim();
+  const description = (record.description || "").trim();
+
+  if (!jobTitle) {
+    console.error(`❌ No job_title for record ${record.id}, skipping`);
+    await this.logError(record.id, "Missing job_title");
+    return;
+  }
+
+  // Combine and tokenize
+  let inputText = `${jobTitle}: ${description}`;
+  let tokens = encode(inputText);
+
+  if (tokens.length > MAX_TOKEN_LENGTH) {
+    console.warn(`⚠️ Truncating input for record ${record.id} from ${tokens.length} tokens to ${MAX_TOKEN_LENGTH}`);
+    tokens = tokens.slice(0, MAX_TOKEN_LENGTH);
+    inputText = tokens.map(token => token.text).join('');
+  }
+
+  try {
+    const openaiRes = await axios.post(
+      "https://api.openai.com/v1/embeddings",
+      {
+        model: "text-embedding-3-large",
+        input: inputText,
+        dimensions: EMBEDDING_DIM,
+      },
+      {
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+        },
+      }
+    );
+
+    const vector = openaiRes.data?.data?.[0]?.embedding;
+
+    if (!Array.isArray(vector) || vector.length !== EMBEDDING_DIM) {
+      throw new Error(`Invalid embedding vector for record ${record.id}`);
+    }
+
+    console.log(`✅ Received valid embedding of length ${vector.length}`);
+
+    await new Promise(resolve => setTimeout(resolve, 100));
+
+    const url = `${this.config.metaBaseURL}/workspace/${this.config.workspaceId}/table/${this.config.tableId}/content/bulk/patch`;
+    const payload = {
+      items: [
+        {
+          row_id: record.id,
+          updates: {
+            combined_embeddings: JSON.stringify(vector),
+          }
+        }
+      ]
+    };
+
+    await axios.post(url, payload, {
+      headers: {
+        Authorization: `Bearer ${this.config.xanoApiKey}`,
+        "Content-Type": "application/json",
+        accept: "application/json",
+      }
+    });
+
+    record.combined_embeddings = vector;
+    console.log(`✅ Updated embedding for record ${record.id}`);
+
+  } catch (error) {
+    console.error(`❌ Embedding update failed for record ${record.id}:`, error.message);
+    if (error.response) {
+      console.error("Status:", error.response.status);
+      console.error("Data:", JSON.stringify(error.response.data, null, 2));
+    }
+    await this.logError(record.id, error.message);
+  }
+}
+
+
 
   async checkExistingRecords(recordIds) {
     console.log(`🔎 Checking for existing records in Elasticsearch: ${recordIds.length} IDs`);
@@ -142,38 +236,32 @@ class XanoToES {
     };
   }
 
-async bulkInsertToES(records) {
-  console.log(`📤 Preparing to bulk insert ${records.length} records to Elasticsearch`);
-  const body = records.flatMap(doc => [
-    { index: { _index: this.config.esIndex } },  // Let ES auto-generate _id
-    doc,
-  ]);
+  async bulkInsertToES(records) {
+    console.log(`📤 Preparing to bulk insert ${records.length} records to Elasticsearch`);
+    const body = records.flatMap(doc => [
+      { index: { _index: this.config.esIndex, _id: doc.id } },
+      doc,
+    ]);
 
-  try {
-    console.log(`🚀 Sending bulk insert to Elasticsearch, index: ${this.config.esIndex}`);
-    const response = await this.es.bulk({ body });
-    
-    if (response.body?.errors) {
-      console.warn("⚠️ Some records failed to index in Elasticsearch");
+    try {
+      console.log(`🚀 Sending bulk insert to Elasticsearch, index: ${this.config.esIndex}`);
+      const response = await this.es.bulk({ body });
       
-      response.body.items.forEach((item, index) => {
-        if (item.index?.error) {
-          console.error(`❌ Elasticsearch error for record at index ${index}:`, item.index.error.reason);
-          this.logError(item.index._id || `unknown-${index}`, `Elasticsearch Error: ${item.index.error.reason}`);
-        }
-      });
-
-      console.error("🔴 Full Elasticsearch response for bulk insert:", JSON.stringify(response.body, null, 2));
-    } else {
-      console.log(`✅ Successfully inserted ${records.length} records to Elasticsearch`);
+      if (response.body?.errors) {
+        console.warn("⚠️ Some records failed to index in Elasticsearch");
+        response.body.items.forEach((item) => {
+          if (item.index?.error) {
+            console.error(`❌ Elasticsearch error for record ${item.index._id}:`, item.index.error.reason);
+            this.logError(item.index._id, `Elasticsearch Error: ${item.index.error.reason}`);
+          }
+        });
+      } else {
+        console.log(`✅ Successfully inserted ${records.length} records to Elasticsearch`);
+      }
+    } catch (error) {
+      console.error("❌ Bulk insert to Elasticsearch failed:", error.message);
     }
-  } catch (error) {
-    console.error("❌ Bulk insert to Elasticsearch failed:", error.message);
-    console.error("🔴 Full error details:", error.response ? error.response.data : error);
   }
-}
-
-
 
   async run() {
     console.log("🏁 Starting Xano to Elasticsearch sync process");
@@ -196,7 +284,23 @@ async bulkInsertToES(records) {
       const newRecords = records.filter(record => !existingIds.has(record.id.toString()));
       console.log(`ℹ️ Found ${newRecords.length} new records to process out of ${records.length}`);
 
-      // Bulk insert new records
+      for (const record of newRecords) {
+        console.log(`🔍 Processing record ${record.id}`);
+        if (!record.combined_embeddings) {
+          console.log(`ℹ️ No embedding found for record ${record.id}, generating new embedding`);
+          await this.updateEmbeddingInXano(record);
+        } else if (typeof record.combined_embeddings === "string") {
+          try {
+            console.log(`ℹ️ Parsing existing embedding for record ${record.id}`);
+            record.combined_embeddings = JSON.parse(record.combined_embeddings);
+          } catch (e) {
+            console.error(`❌ Failed to parse embedding for record ${record.id}`);
+            await this.logError(record.id, "Failed to parse combined_embeddings");
+            record.combined_embeddings = [];
+          }
+        }
+      }
+
       if (newRecords.length > 0) {
         console.log(`🗄️ Mapping ${newRecords.length} new records to Elasticsearch format`);
         const mapped = newRecords.map(this.mapToESFormat);
@@ -213,55 +317,6 @@ async bulkInsertToES(records) {
 
     console.log("\n✅ All records processed successfully");
   }
-
-// async run() {
-//   console.log("🏁 Starting Xano to Elasticsearch sync process");
-//   await this.loadCheckpoint();
-
-//   let page = this.lastProcessedPage + 1;
-
-//   while (true) {
-//     console.log(`\n📄 Processing page ${page}`);
-//     const records = await this.fetchRecords(page);
-
-//     // Stop when Xano returns nothing
-//     if (!records || records.length === 0) {
-//       console.log("✅ No more records. Stopping.");
-//       break;
-//     }
-
-//     // Check for existing records
-//     const recordIds = records.map(r => String(r.id));
-//     const existingIds = await this.checkExistingRecords(recordIds);
-//     const newRecords = records.filter(r => !existingIds.has(String(r.id)));
-//     console.log(`ℹ️ New records this page: ${newRecords.length}/${records.length}`);
-
-//     if (newRecords.length > 0) {
-//       console.log(`🗄️ Mapping ${newRecords.length} records to Elasticsearch format`);
-//       const mapped = newRecords.map(this.mapToESFormat.bind(this));
-//       await this.bulkInsertToES(mapped);
-//     } else {
-//       console.log("ℹ️ Nothing new to insert for this page");
-//     }
-
-//     // Update checkpoint
-//     this.lastProcessedPage = page;
-//     this.lastProcessedRecordId = Math.max(...records.map(r => parseInt(r.id, 10)).filter(Number.isFinite));
-//     console.log(`📌 Updating checkpoint: page ${this.lastProcessedPage}, last record ID ${this.lastProcessedRecordId}`);
-//     await this.saveCheckpoint();
-
-//     // If the page is not full, we've hit the end
-//     if (records.length < this.config.recordsPerPage) {
-//       console.log("✅ Last page reached (short page). Stopping.");
-//       break;
-//     }
-
-//     page += 1;
-//   }
-
-//   console.log("\n✅ All records processed successfully");
-// }
-
 }
 
 new XanoToES().run().catch((err) => console.error("❌ Fatal error in sync process:", err));
